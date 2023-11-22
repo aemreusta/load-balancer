@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,6 +60,10 @@ func main() {
 	timeoutTimer := time.NewTimer(time.Second * time.Duration(config.ConnectionTimeout))
 	defer timeoutTimer.Stop()
 
+	// Worker pool for concurrent handling
+	workerPoolSize := 10
+	workerPool := make(chan struct{}, workerPoolSize)
+
 	// Accept incoming connections and handle them
 	for {
 		conn, err := listener.Accept()
@@ -73,11 +78,20 @@ func main() {
 		// Increment the WaitGroup counter and notify the user about handling a new connection
 		wg.Add(1)
 		fmt.Printf("Handling connection from %s. Proxying to backend: %s\n", conn.RemoteAddr(), backend)
+
+		// Use the worker pool
+		workerPool <- struct{}{}
 		go func() {
-			defer wg.Done()
-			err := proxy(backend, conn)
+			defer func() {
+				<-workerPool
+				wg.Done()
+			}()
+			// Use context with timeout
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(config.ConnectionTimeout))
+			defer cancel()
+			err := handleConnection(ctx, backend, conn)
 			if err != nil {
-				log.Printf("failed to proxy: %s", err)
+				log.Printf("failed to handle connection: %s", err)
 			}
 		}()
 
@@ -89,11 +103,12 @@ func main() {
 	select {
 	case <-sig:
 		log.Println("Shutting down...")
-		return
 	case <-timeoutTimer.C:
 		log.Println("Connection timeout reached. Shutting down...")
-		return
 	}
+
+	// Close the listener after the loop and signal handling
+	listener.Close()
 }
 
 // proxy handles the proxying of data between the client and the backend server
@@ -131,6 +146,54 @@ func proxy(backend string, c net.Conn) error {
 
 	// Wait for both copy operations to finish
 	wg.Wait()
+
+	// Notify the user that the connection has been closed
+	fmt.Printf("Connection from %s closed. Proxying to %s terminated.\n", c.RemoteAddr(), backend)
+
+	return nil
+}
+
+// handleConnection handles the connection with context timeout
+func handleConnection(ctx context.Context, backend string, c net.Conn) error {
+	defer c.Close()
+
+	// Connect to the chosen backend server with a timeout
+	bc, err := net.DialTimeout("tcp", backend, time.Second*5)
+	if err != nil {
+		return fmt.Errorf("failed to connect to backend %s: %v", backend, err)
+	}
+	defer bc.Close()
+
+	// Use a WaitGroup to wait for both copy operations to finish
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Copy data from client to backend
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(bc, c)
+		if err != nil {
+			log.Printf("failed to copy from client to backend: %s", err)
+		}
+	}()
+
+	// Copy data from backend to client
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(c, bc)
+		if err != nil {
+			log.Printf("failed to copy from backend to client: %s", err)
+		}
+	}()
+
+	// Wait for both copy operations to finish or context timeout
+	select {
+	case <-ctx.Done():
+		log.Println("Connection timed out.")
+		return ctx.Err()
+	case <-time.After(time.Second * 5): // Adjust timeout duration as needed
+		log.Println("Connection handling completed.")
+	}
 
 	// Notify the user that the connection has been closed
 	fmt.Printf("Connection from %s closed. Proxying to %s terminated.\n", c.RemoteAddr(), backend)
